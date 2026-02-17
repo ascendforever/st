@@ -1,0 +1,90 @@
+kind: pipeline
+type: docker
+name: build-and-release-package
+
+trigger:
+  branch:
+    - fork
+
+steps:
+
+  - name: build
+    image: buildpack-deps:trixie
+    commands:
+      - apt-get update
+      - apt-get install -y libx11-dev libxft-dev
+      - make clean all
+
+  - name: build-package
+    image: debian:trixie-slim
+    commands:
+      # basics
+      - VERSION="$$(sed -E '/^VERSION/!d; s/^VERSION *= *(.+).*/\\\\1/' config.mk)"
+      - shortsha="$$(printf "%s" "${DRONE_COMMIT_SHA}" | cut -c1-8)"
+      - date="$$(date -u +%Y%m%d-%H%M)"
+      - version="$${VERSION}~$${date}~$${shortsha}"
+      - |
+        cat > control <<EOF
+        Package: st-af
+        Version: $$version
+        Section: utils
+        Priority: optional
+        Architecture: amd64
+        Conflicts: stterm
+        Maintainer: George H <georgeh124v2@gmail.com>
+        Description: Simple terminal (st)
+         A minimalistic terminal emulator for X.
+        EOF
+      - install -Dm644 control -t st-deb/DEBIAN/
+      # executables
+      - install -Dm755 st st-autocomplete -t st-deb/usr/bin/
+      # manpages
+      - sed -i "s/VERSION/$$VERSION/g" st.1
+      - install -Dm644 st.1 -t st-deb/usr/share/man/man1/
+      # terminfo - seems to be shipped with debian already
+      # - apt-get update
+      # - apt-get install -y ncurses-term
+      # - tic -sx -o st-deb/usr/share/terminfo st.info
+      # docs
+      - install -Dm644 README LICENSE FAQ -t st-deb/usr/share/doc/st/
+      # build
+      - dpkg-deb --build st-deb
+      - mv st-deb.deb "st_$${version}.deb"
+
+  - name: upload-package
+    image: alpine:3.22
+    environment:
+      SSH_USER: deploy
+      SSH_HOST: 100.64.0.13
+      SSH_KEY:
+        from_secret: repo_deploy_ssh_key
+    commands:
+      - apk add --no-cache openssh-client
+      - mkdir -p /root/.ssh
+      - echo "$SSH_KEY" > /root/.ssh/id_rsa
+      - chmod 600 /root/.ssh/id_rsa
+      - ssh-keyscan -H "$SSH_HOST" >> /root/.ssh/known_hosts
+      - scp *.deb "$SSH_USER@$SSH_HOST:/srv/deb/incoming/"
+
+  - name: publish-package
+    image: alpine:3.22
+    environment:
+      SSH_USER: deploy
+      SSH_HOST: 100.64.0.13
+      SSH_KEY:
+        from_secret: repo_deploy_ssh_key
+    commands:
+      - apk add --no-cache openssh-client
+      - mkdir -p /root/.ssh
+      - echo "$SSH_KEY" > /root/.ssh/id_rsa
+      - chmod 600 /root/.ssh/id_rsa
+      - ssh-keyscan -H "$SSH_HOST" >> /root/.ssh/known_hosts
+      - |-
+        ls *.deb | ssh "$SSH_USER@$SSH_HOST" bash -c '
+          cd /srv/deb/incoming || exit 1
+          debs=()
+          while read -r deb; do debs+=("$deb"); done
+          echo debs: "$${debs[@]}"
+          sudo -u user repo-add-deb "$${debs[@]}"
+          rm -f "$${debs[@]}"
+        '
